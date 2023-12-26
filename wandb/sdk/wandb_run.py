@@ -14,7 +14,7 @@ import traceback
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import IntEnum
 from types import TracebackType
 from typing import (
@@ -35,21 +35,21 @@ from typing import (
 import requests
 
 import wandb
+import wandb.env
 from wandb import errors, trigger
 from wandb._globals import _datatypes_set_callback
 from wandb.apis import internal, public
 from wandb.apis.internal import Api
 from wandb.apis.public import Api as PublicApi
 from wandb.proto.wandb_internal_pb2 import (
+    JobInfoResponse,
     MetricRecord,
     PollExitResponse,
     Result,
     RunRecord,
     ServerInfoResponse,
 )
-from wandb.sdk.artifacts.lazy_artifact import LazyArtifact
-from wandb.sdk.artifacts.local_artifact import Artifact as LocalArtifact
-from wandb.sdk.artifacts.public_artifact import Artifact as PublicArtifact
+from wandb.sdk.artifacts.artifact import Artifact
 from wandb.sdk.internal import job_builder
 from wandb.sdk.lib.import_hooks import (
     register_post_import_hook,
@@ -60,7 +60,7 @@ from wandb.util import (
     _is_artifact_object,
     _is_artifact_string,
     _is_artifact_version_weave_dict,
-    _is_py_path,
+    _is_py_or_dockerfile,
     _resolve_aliases,
     add_import_hook,
     parse_artifact_string,
@@ -89,7 +89,7 @@ from .lib.printer import get_printer
 from .lib.proto_util import message_to_dict
 from .lib.reporting import Reporter
 from .lib.wburls import wburls
-from .wandb_settings import Settings, SettingsConsole
+from .wandb_settings import Settings
 from .wandb_setup import _WandbSetup
 
 if TYPE_CHECKING:
@@ -100,11 +100,11 @@ if TYPE_CHECKING:
 
     import wandb.apis.public
     import wandb.sdk.backend.backend
-    import wandb.sdk.interface.interface_grpc
     import wandb.sdk.interface.interface_queue
     from wandb.proto.wandb_internal_pb2 import (
         CheckVersionResponse,
         GetSummaryResponse,
+        InternalMessagesResponse,
         SampledHistoryResponse,
     )
 
@@ -163,6 +163,8 @@ class RunStatusChecker:
     _stop_status_handle: Optional[MailboxHandle]
     _network_status_lock: threading.Lock
     _network_status_handle: Optional[MailboxHandle]
+    _internal_messages_lock: threading.Lock
+    _internal_messages_handle: Optional[MailboxHandle]
 
     def __init__(
         self,
@@ -192,9 +194,18 @@ class RunStatusChecker:
             daemon=True,
         )
 
+        self._internal_messages_lock = threading.Lock()
+        self._internal_messages_handle = None
+        self._internal_messages_thread = threading.Thread(
+            target=self.check_internal_messages,
+            name="IntMsgThr",
+            daemon=True,
+        )
+
     def start(self) -> None:
         self._stop_thread.start()
         self._network_status_thread.start()
+        self._internal_messages_thread.start()
 
     def _loop_check_status(
         self,
@@ -280,6 +291,20 @@ class RunStatusChecker:
             process=_process_stop_status,
         )
 
+    def check_internal_messages(self) -> None:
+        def _process_internal_messages(result: Result) -> None:
+            internal_messages = result.response.internal_messages_response
+            for msg in internal_messages.messages.warning:
+                wandb.termwarn(msg)
+
+        self._loop_check_status(
+            lock=self._internal_messages_lock,
+            set_handle=lambda x: setattr(self, "_internal_messages_handle", x),
+            timeout=1,
+            request=self._interface.deliver_internal_messages,
+            process=_process_internal_messages,
+        )
+
     def stop(self) -> None:
         self._join_event.set()
         with self._stop_status_lock:
@@ -288,11 +313,15 @@ class RunStatusChecker:
         with self._network_status_lock:
             if self._network_status_handle:
                 self._network_status_handle.abandon()
+        with self._internal_messages_lock:
+            if self._internal_messages_handle:
+                self._internal_messages_handle.abandon()
 
     def join(self) -> None:
         self.stop()
         self._stop_thread.join()
         self._network_status_thread.join()
+        self._internal_messages_thread.join()
 
 
 class _run_decorator:  # noqa: N801
@@ -322,7 +351,7 @@ class _run_decorator:  # noqa: N801
                     raise RuntimeError(message)
                 cls._is_attaching = func.__name__
                 try:
-                    wandb._attach(run=self)
+                    wandb._attach(run=self)  # type: ignore
                 except Exception as e:
                     # In case the attach fails we will raise the exception that caused the issue.
                     # This exception should be caught and fail the execution of the program.
@@ -476,15 +505,13 @@ class Run:
     _job_type: Optional[str]
     _name: Optional[str]
     _notes: Optional[str]
+    _sweep_id: Optional[str]
 
     _run_obj: Optional[RunRecord]
     # Use string literal annotation because of type reference loop
     _backend: Optional["wandb.sdk.backend.backend.Backend"]
     _internal_run_interface: Optional[
-        Union[
-            "wandb.sdk.interface.interface_queue.InterfaceQueue",
-            "wandb.sdk.interface.interface_grpc.InterfaceGrpc",
-        ]
+        "wandb.sdk.interface.interface_queue.InterfaceQueue"
     ]
     _wl: Optional[_WandbSetup]
 
@@ -504,9 +531,11 @@ class Run:
     _check_version: Optional["CheckVersionResponse"]
     _sampled_history: Optional["SampledHistoryResponse"]
     _final_summary: Optional["GetSummaryResponse"]
+    _job_info: Optional["JobInfoResponse"]
     _poll_exit_handle: Optional[MailboxHandle]
     _poll_exit_response: Optional[PollExitResponse]
     _server_info_response: Optional[ServerInfoResponse]
+    _internal_messages_response: Optional["InternalMessagesResponse"]
 
     _stdout_slave_fd: Optional[int]
     _stderr_slave_fd: Optional[int]
@@ -555,12 +584,13 @@ class Run:
         self._config._set_settings(self._settings)
         self._backend = None
         self._internal_run_interface = None
+        # todo: perhaps this should be a property that is a noop on a finished run
         self.summary = wandb_summary.Summary(
             self._summary_get_current_summary_callback,
         )
         self.summary._set_update_callback(self._summary_update_callback)
         self._step = 0
-        self._torch_history: Optional["wandb.wandb_torch.TorchHistory"] = None
+        self._torch_history: Optional[wandb.wandb_torch.TorchHistory] = None
 
         # todo: eventually would be nice to make this configurable using self._settings._start_time
         #  need to test (jhr): if you set start time to 2 days ago and run a test for 15 minutes,
@@ -584,6 +614,7 @@ class Run:
         self._tags = None
         self._remote_url = None
         self._commit = None
+        self._sweep_id = None
 
         self._hooks = None
         self._teardown_hooks = []
@@ -609,7 +640,9 @@ class Run:
         self._final_summary = None
         self._poll_exit_response = None
         self._server_info_response = None
+        self._internal_messages_response = None
         self._poll_exit_handle = None
+        self._job_info = None
 
         # Initialize telemetry object
         self._telemetry_obj = telemetry.TelemetryRecord()
@@ -625,7 +658,7 @@ class Run:
         # Initial scope setup for sentry.
         # This might get updated when the actual run comes back.
         wandb._sentry.configure_scope(
-            settings=self._settings,
+            tags=dict(self._settings),
             process_context="user",
         )
 
@@ -648,6 +681,19 @@ class Run:
             self._config.update_locked(
                 launch_config, user="launch", _allow_val_change=True
             )
+
+        # if run is from a launch queue, add queue id to _wandb config
+        launch_queue_name = wandb.env.get_launch_queue_name()
+        if launch_queue_name:
+            config[wandb_key]["launch_queue_name"] = launch_queue_name
+
+        launch_queue_entity = wandb.env.get_launch_queue_entity()
+        if launch_queue_entity:
+            config[wandb_key]["launch_queue_entity"] = launch_queue_entity
+
+        launch_trace_id = wandb.env.get_launch_trace_id()
+        if launch_trace_id:
+            config[wandb_key]["launch_trace_id"] = launch_trace_id
 
         self._config._update(config, ignore_locked=True)
 
@@ -751,6 +797,8 @@ class Run:
             self._notes = settings.run_notes
         if settings.run_tags is not None:
             self._tags = settings.run_tags
+        if settings.sweep_id is not None:
+            self._sweep_id = settings.sweep_id
 
     def _make_proto_run(self, run: RunRecord) -> None:
         """Populate protocol buffer RunData for interface/interface."""
@@ -777,6 +825,8 @@ class Run:
             run.git.remote_url = self._remote_url
         if self._commit is not None:
             run.git.commit = self._commit
+        if self._sweep_id is not None:
+            run.sweep_id = self._sweep_id
         # Note: run.config is set in interface/interface:_make_run()
 
     def _populate_git_info(self) -> None:
@@ -1049,9 +1099,13 @@ class Run:
         self,
         root: Optional[str] = ".",
         name: Optional[str] = None,
-        include_fn: Callable[[str], bool] = _is_py_path,
-        exclude_fn: Callable[[str], bool] = filenames.exclude_wandb_fn,
-    ) -> Optional[LocalArtifact]:
+        include_fn: Union[
+            Callable[[str, str], bool], Callable[[str], bool]
+        ] = _is_py_or_dockerfile,
+        exclude_fn: Union[
+            Callable[[str, str], bool], Callable[[str], bool]
+        ] = filenames.exclude_wandb_fn,
+    ) -> Optional[Artifact]:
         """Save the current state of your code to a W&B Artifact.
 
         By default, it walks the current directory and logs all files that end with `.py`.
@@ -1061,11 +1115,13 @@ class Run:
             name: (str, optional) The name of our code artifact. By default, we'll name
                 the artifact `source-$PROJECT_ID-$ENTRYPOINT_RELPATH`. There may be scenarios where you want
                 many runs to share the same artifact. Specifying name allows you to achieve that.
-            include_fn: A callable that accepts a file path and
+            include_fn: A callable that accepts a file path and (optionally) root path and
                 returns True when it should be included and False otherwise. This
-                defaults to: `lambda path: path.endswith(".py")`
-            exclude_fn: A callable that accepts a file path and returns `True` when it should be
-                excluded and `False` otherwise. This defaults to: `lambda path: False`
+                defaults to: `lambda path, root: path.endswith(".py")`
+            exclude_fn: A callable that accepts a file path and (optionally) root path and
+                returns `True` when it should be excluded and `False` otherwise. This
+                defaults to a function that excludes all files within `<root>/.wandb/`
+                and `<root>/wandb/` directories.
 
         Examples:
             Basic usage
@@ -1076,7 +1132,9 @@ class Run:
             Advanced usage
             ```python
             run.log_code(
-                "../", include_fn=lambda path: path.endswith(".py") or path.endswith(".ipynb")
+                "../",
+                include_fn=lambda path: path.endswith(".py") or path.endswith(".ipynb"),
+                exclude_fn=lambda path, root: os.path.relpath(path, root).startswith("cache/"),
             )
             ```
 
@@ -1105,7 +1163,7 @@ class Run:
                 files_added = True
                 save_name = os.path.relpath(file_path, root)
                 art.add_file(file_path, name=save_name)
-        # Add any manually staged files such is ipynb notebooks
+        # Add any manually staged files such as ipynb notebooks
         for dirpath, _, files in os.walk(self._settings._tmp_code_dir):
             for fname in files:
                 file_path = os.path.join(dirpath, fname)
@@ -1113,6 +1171,9 @@ class Run:
                 files_added = True
                 art.add_file(file_path, name=save_name)
         if not files_added:
+            wandb.termwarn(
+                "No relevant files were detected in the specified directory. No code will be logged to your run."
+            )
             return None
 
         return self._log_artifact(art)
@@ -1155,7 +1216,7 @@ class Run:
     def entity(self) -> str:
         """The name of the W&B entity associated with the run.
 
-        Entity can be a user name or the name of a team or organization.
+        Entity can be a username or the name of a team or organization.
         """
         return self._entity or ""
 
@@ -1185,9 +1246,7 @@ class Run:
         for k, v in (("code", code), ("repo", repo), ("code_version", code_version)):
             if v and not RE_LABEL.match(v):
                 wandb.termwarn(
-                    "Label added for '{}' with invalid identifier '{}' (ignored).".format(
-                        k, v
-                    ),
+                    f"Label added for '{k}' with invalid identifier '{v}' (ignored).",
                     repeat=False,
                 )
         for v in kwargs:
@@ -1285,15 +1344,15 @@ class Run:
             self._backend.interface.publish_config(key=key, val=val, data=data)
 
     def _config_artifact_callback(
-        self, key: str, val: Union[str, LocalArtifact, dict]
-    ) -> Union[LocalArtifact, PublicArtifact]:
+        self, key: str, val: Union[str, Artifact, dict]
+    ) -> Artifact:
         # artifacts can look like dicts as they are passed into the run config
         # since the run config stores them on the backend as a dict with fields shown
         # in wandb.util.artifact_to_json
         if _is_artifact_version_weave_dict(val):
             assert isinstance(val, dict)
             public_api = self._public_api()
-            artifact = PublicArtifact.from_id(val["id"], public_api.client)
+            artifact = Artifact._from_id(val["id"], public_api.client)
             return self.use_artifact(artifact, use_as=key)
         elif _is_artifact_string(val):
             # this will never fail, but is required to make mypy happy
@@ -1306,12 +1365,11 @@ class Run:
             else:
                 public_api = self._public_api()
             if is_id:
-                artifact = PublicArtifact.from_id(artifact_string, public_api._client)
+                artifact = Artifact._from_id(artifact_string, public_api._client)
             else:
                 artifact = public_api.artifact(name=artifact_string)
             # in the future we'll need to support using artifacts from
-            # different instances of wandb. simplest way to do that is
-            # likely to convert the retrieved PublicArtifact to a LocalArtifact
+            # different instances of wandb.
 
             return self.use_artifact(artifact, use_as=key)
         elif _is_artifact_object(val):
@@ -1355,12 +1413,13 @@ class Run:
     def _datatypes_callback(self, fname: str) -> None:
         if not self._backend or not self._backend.interface:
             return
-        files: "FilesDict" = dict(files=[(GlobStr(glob.escape(fname)), "now")])
+        files: FilesDict = dict(files=[(GlobStr(glob.escape(fname)), "now")])
         self._backend.interface.publish_files(files)
 
     def _visualization_hack(self, row: Dict[str, Any]) -> Dict[str, Any]:
         # TODO(jhr): move visualize hack somewhere else
         chart_keys = set()
+        split_table_set = set()
         for k in row:
             if isinstance(row[k], Visualize):
                 key = row[k].get_config_key(k)
@@ -1370,9 +1429,15 @@ class Run:
             elif isinstance(row[k], CustomChart):
                 chart_keys.add(k)
                 key = row[k].get_config_key(k)
-                value = row[k].get_config_value(
-                    "Vega2", row[k].user_query(f"{k}_table")
-                )
+                if row[k]._split_table:
+                    value = row[k].get_config_value(
+                        "Vega2", row[k].user_query(f"Custom Chart Tables/{k}_table")
+                    )
+                    split_table_set.add(k)
+                else:
+                    value = row[k].get_config_value(
+                        "Vega2", row[k].user_query(f"{k}_table")
+                    )
                 row[k] = row[k]._data
                 self._config_callback(val=value, key=key)
 
@@ -1380,7 +1445,10 @@ class Run:
             # remove the chart key from the row
             # TODO: is this really the right move? what if the user logs
             #     a non-custom chart to this key?
-            row[f"{k}_table"] = row.pop(k)
+            if k in split_table_set:
+                row[f"Custom Chart Tables/{k}_table"] = row.pop(k)
+            else:
+                row[f"{k}_table"] = row.pop(k)
         return row
 
     def _partial_history_callback(
@@ -1439,10 +1507,7 @@ class Run:
 
     def _set_internal_run_interface(
         self,
-        interface: Union[
-            "wandb.sdk.interface.interface_queue.InterfaceQueue",
-            "wandb.sdk.interface.interface_grpc.InterfaceGrpc",
-        ],
+        interface: "wandb.sdk.interface.interface_queue.InterfaceQueue",
     ) -> None:
         self._internal_run_interface = interface
 
@@ -1473,7 +1538,8 @@ class Run:
             summary_dict = {}
             for orig in run_obj.summary.update:
                 summary_dict[orig.key] = json.loads(orig.value_json)
-            self.summary.update(summary_dict)
+            if summary_dict:
+                self.summary.update(summary_dict)
         self._step = self._get_starting_step()
 
         # update settings from run_obj
@@ -1482,7 +1548,7 @@ class Run:
 
         wandb._sentry.configure_scope(
             process_context="user",
-            settings=self._settings,
+            tags=dict(self._settings),
         )
 
     def _add_singleton(
@@ -1560,7 +1626,7 @@ class Run:
         commit: Optional[bool] = None,
         sync: Optional[bool] = None,
     ) -> None:
-        """Log a dictonary of data to the current run's history.
+        """Log a dictionary of data to the current run's history.
 
         Use `wandb.log` to log data from runs, such as scalars, images, video,
         histograms, plots, and tables.
@@ -1629,8 +1695,8 @@ class Run:
             ```python
             import wandb
 
-            wandb.init()
-            wandb.log({"accuracy": 0.9, "epoch": 5})
+            run = wandb.init()
+            run.log({"accuracy": 0.9, "epoch": 5})
             ```
 
             ### Incremental logging
@@ -1638,10 +1704,10 @@ class Run:
             ```python
             import wandb
 
-            wandb.init()
-            wandb.log({"loss": 0.2}, commit=False)
+            run = wandb.init()
+            run.log({"loss": 0.2}, commit=False)
             # Somewhere else when I'm ready to report this step:
-            wandb.log({"accuracy": 0.8})
+            run.log({"accuracy": 0.8})
             ```
 
             ### Histogram
@@ -1652,8 +1718,8 @@ class Run:
 
             # sample gradients at random from normal distribution
             gradients = np.random.randn(100, 100)
-            wandb.init()
-            wandb.log({"gradients": wandb.Histogram(gradients)})
+            run = wandb.init()
+            run.log({"gradients": wandb.Histogram(gradients)})
             ```
 
             ### Image from numpy
@@ -1662,13 +1728,13 @@ class Run:
             import numpy as np
             import wandb
 
-            wandb.init()
+            run = wandb.init()
             examples = []
             for i in range(3):
                 pixels = np.random.randint(low=0, high=256, size=(100, 100, 3))
                 image = wandb.Image(pixels, caption=f"random field {i}")
                 examples.append(image)
-            wandb.log({"examples": examples})
+            run.log({"examples": examples})
             ```
 
             ### Image from PIL
@@ -1678,14 +1744,14 @@ class Run:
             from PIL import Image as PILImage
             import wandb
 
-            wandb.init()
+            run = wandb.init()
             examples = []
             for i in range(3):
                 pixels = np.random.randint(low=0, high=256, size=(100, 100, 3), dtype=np.uint8)
                 pil_image = PILImage.fromarray(pixels, mode="RGB")
                 image = wandb.Image(pil_image, caption=f"random field {i}")
                 examples.append(image)
-            wandb.log({"examples": examples})
+            run.log({"examples": examples})
             ```
 
             ### Video from numpy
@@ -1694,10 +1760,10 @@ class Run:
             import numpy as np
             import wandb
 
-            wandb.init()
+            run = wandb.init()
             # axes are (time, channel, height, width)
             frames = np.random.randint(low=0, high=256, size=(10, 3, 100, 100), dtype=np.uint8)
-            wandb.log({"video": wandb.Video(frames, fps=4)})
+            run.log({"video": wandb.Video(frames, fps=4)})
             ```
 
             ### Matplotlib Plot
@@ -1707,22 +1773,28 @@ class Run:
             import numpy as np
             import wandb
 
-            wandb.init()
+            run = wandb.init()
             fig, ax = plt.subplots()
             x = np.linspace(0, 10)
             y = x * x
             ax.plot(x, y)  # plot y = x^2
-            wandb.log({"chart": fig})
+            run.log({"chart": fig})
             ```
 
             ### PR Curve
             ```python
-            wandb.log({"pr": wandb.plots.precision_recall(y_test, y_probas, labels)})
+            import wandb
+
+            run = wandb.init()
+            run.log({"pr": wandb.plots.precision_recall(y_test, y_probas, labels)})
             ```
 
             ### 3D Object
             ```python
-            wandb.log(
+            import wandb
+
+            run = wandb.init()
+            run.log(
                 {
                     "generated_samples": [
                         wandb.Object3D(open("sample.obj")),
@@ -1761,7 +1833,7 @@ class Run:
             glob_str: (string) a relative or absolute path to a unix glob or regular
                 path.  If this isn't specified the method is a noop.
             base_path: (string) the base path to run the glob relative to
-            policy: (string) on of `live`, `now`, or `end`
+            policy: (string) one of `live`, `now`, or `end`
                 - live: upload the file as it changes, overwriting the previous version
                 - now: upload the file once now
                 - end: only upload file when the run ends
@@ -1844,7 +1916,7 @@ class Run:
                 )
                 % file_str
             )
-        files_dict: "FilesDict" = dict(files=[(wandb_glob_str, policy)])
+        files_dict: FilesDict = dict(files=[(wandb_glob_str, policy)])
         if self._backend and self._backend.interface:
             self._backend.interface.publish_files(files_dict)
         return files
@@ -1955,6 +2027,7 @@ class Run:
         data_table: "wandb.Table",
         fields: Dict[str, Any],
         string_fields: Optional[Dict[str, Any]] = None,
+        split_table: Optional[bool] = False,
     ) -> CustomChart:
         """Create a custom plot on a table.
 
@@ -1967,7 +2040,9 @@ class Run:
             string_fields: a dict that provides values for any string constants
                 the custom visualization needs
         """
-        return custom_chart(vega_spec_name, data_table, fields, string_fields or {})
+        return custom_chart(
+            vega_spec_name, data_table, fields, string_fields or {}, split_table
+        )
 
     def _add_panel(
         self, visualize_key: str, panel_type: str, panel_config: dict
@@ -1991,29 +2066,32 @@ class Run:
             plot_table=self.plot_table,
             alert=self.alert,
             mark_preempting=self.mark_preempting,
+            log_model=self.log_model,
+            use_model=self.use_model,
+            link_model=self.link_model,
         )
 
     def _redirect(
         self,
         stdout_slave_fd: Optional[int],
         stderr_slave_fd: Optional[int],
-        console: Optional[SettingsConsole] = None,
+        console: Optional[str] = None,
     ) -> None:
         if console is None:
-            console = self._settings._console
+            console = self._settings.console
         # only use raw for service to minimize potential changes
-        if console == SettingsConsole.WRAP:
+        if console == "wrap":
             if not self._settings._disable_service:
-                console = SettingsConsole.WRAP_RAW
+                console = "wrap_raw"
             else:
-                console = SettingsConsole.WRAP_EMU
+                console = "wrap_emu"
         logger.info("redirect: %s", console)
 
         out_redir: redirect.RedirectBase
         err_redir: redirect.RedirectBase
 
         # raw output handles the output_log writing in the internal process
-        if console in {SettingsConsole.REDIRECT, SettingsConsole.WRAP_EMU}:
+        if console in {"redirect", "wrap_emu"}:
             output_log_path = os.path.join(
                 self._settings.files_dir, filenames.OUTPUT_FNAME
             )
@@ -2023,7 +2101,7 @@ class Run:
                     open(output_log_path, "wb")
                 )
 
-        if console == SettingsConsole.REDIRECT:
+        if console == "redirect":
             logger.info("Redirecting console.")
             out_redir = redirect.Redirect(
                 src="stdout",
@@ -2052,10 +2130,10 @@ class Run:
                         "wrapping stdout/err."
                     )
                     wandb.termlog(msg)
-                    self._redirect(None, None, console=SettingsConsole.WRAP)
+                    self._redirect(None, None, console="wrap")
 
                 add_import_hook("tensorflow", wrap_fallback)
-        elif console == SettingsConsole.WRAP_EMU:
+        elif console == "wrap_emu":
             logger.info("Wrapping output streams.")
             out_redir = redirect.StreamWrapper(
                 src="stdout",
@@ -2071,7 +2149,7 @@ class Run:
                     self._output_writer.write,  # type: ignore
                 ],
             )
-        elif console == SettingsConsole.WRAP_RAW:
+        elif console == "wrap_raw":
             logger.info("Wrapping output streams.")
             out_redir = redirect.StreamRawWrapper(
                 src="stdout",
@@ -2085,7 +2163,7 @@ class Run:
                     lambda data: self._console_raw_callback("stderr", data),
                 ],
             )
-        elif console == SettingsConsole.OFF:
+        elif console == "off":
             return
         else:
             raise ValueError("unhandled console")
@@ -2144,7 +2222,7 @@ class Run:
             self._backend.cleanup()
             logger.error("Problem finishing run", exc_info=e)
             wandb.termerror("Problem finishing run")
-            traceback.print_exception(*sys.exc_info())
+            traceback.print_exc()
         else:
             self._on_final()
         finally:
@@ -2197,6 +2275,17 @@ class Run:
 
         if self._settings.save_code and self._settings.code_dir is not None:
             self.log_code(self._settings.code_dir)
+
+        if self._settings._save_requirements:
+            if self._backend and self._backend.interface:
+                import pkg_resources
+
+                logger.debug(
+                    "Saving list of pip packages installed into the current environment"
+                )
+                self._backend.interface.publish_python_packages(
+                    pkg_resources.working_set
+                )
 
         if self._backend and self._backend.interface and not self._settings._offline:
             self._run_status_checker = RunStatusChecker(
@@ -2272,7 +2361,7 @@ class Run:
         source_dict: "JobSourceDict",
         installed_packages_list: List[str],
         patch_path: Optional[os.PathLike] = None,
-    ) -> "LocalArtifact":
+    ) -> "Artifact":
         job_artifact = job_builder.JobArtifact(name)
         if patch_path and os.path.exists(patch_path):
             job_artifact.add_file(FilePathStr(str(patch_path)), "diff.patch")
@@ -2290,7 +2379,7 @@ class Run:
         installed_packages_list: List[str],
         docker_image_name: Optional[str] = None,
         args: Optional[List[str]] = None,
-    ) -> Optional["LocalArtifact"]:
+    ) -> Optional["Artifact"]:
         docker_image_name = docker_image_name or os.getenv("WANDB_DOCKER")
 
         if not docker_image_name:
@@ -2314,7 +2403,7 @@ class Run:
 
     def _log_job_artifact_with_image(
         self, docker_image_name: str, args: Optional[List[str]] = None
-    ) -> LocalArtifact:
+    ) -> Artifact:
         packages, in_types, out_types = self._make_job_source_reqs()
         job_artifact = self._create_image_job(
             in_types,
@@ -2334,7 +2423,7 @@ class Run:
     def _on_probe_exit(self, probe_handle: MailboxProbe) -> None:
         handle = probe_handle.get_mailbox_handle()
         if handle:
-            result = handle.wait(timeout=0)
+            result = handle.wait(timeout=0, release=False)
             if not result:
                 return
             probe_handle.set_probe_result(result)
@@ -2365,24 +2454,34 @@ class Run:
         exit_handle = self._backend.interface.deliver_exit(self._exit_code)
         exit_handle.add_probe(on_probe=self._on_probe_exit)
 
-        self._footer_exit_status_info(
-            self._exit_code, settings=self._settings, printer=self._printer
-        )
+        # this message is confusing, we should remove it
+        # self._footer_exit_status_info(
+        #     self._exit_code, settings=self._settings, printer=self._printer
+        # )
 
         _ = exit_handle.wait(timeout=-1, on_progress=self._on_progress_exit)
 
-        # dispatch all our final requests
         poll_exit_handle = self._backend.interface.deliver_poll_exit()
+        # wait for them, it's ok to do this serially but this can be improved
+        result = poll_exit_handle.wait(timeout=-1)
+        assert result
+        self._footer_file_pusher_status_info(
+            result.response.poll_exit_response, printer=self._printer
+        )
+        self._poll_exit_response = result.response.poll_exit_response
+        internal_messages_handle = self._backend.interface.deliver_internal_messages()
+        result = internal_messages_handle.wait(timeout=-1)
+        assert result
+        self._internal_messages_response = result.response.internal_messages_response
+
+        # dispatch all our final requests
+
         server_info_handle = self._backend.interface.deliver_request_server_info()
         final_summary_handle = self._backend.interface.deliver_get_summary()
         sampled_history_handle = (
             self._backend.interface.deliver_request_sampled_history()
         )
-
-        # wait for them, it's ok to do this serially but this can be improved
-        result = poll_exit_handle.wait(timeout=-1)
-        assert result
-        self._poll_exit_response = result.response.poll_exit_response
+        job_info_handle = self._backend.interface.deliver_request_job_info()
 
         result = server_info_handle.wait(timeout=-1)
         assert result
@@ -2395,6 +2494,10 @@ class Run:
         result = final_summary_handle.wait(timeout=-1)
         assert result
         self._final_summary = result.response.get_summary_response
+
+        result = job_info_handle.wait(timeout=-1)
+        assert result
+        self._job_info = result.response.job_info_response
 
         if self._backend:
             self._backend.cleanup()
@@ -2412,13 +2515,15 @@ class Run:
 
     def _on_final(self) -> None:
         self._footer(
-            self._sampled_history,
-            self._final_summary,
-            self._poll_exit_response,
-            self._server_info_response,
-            self._check_version,
-            self._reporter,
-            self._quiet,
+            sampled_history=self._sampled_history,
+            final_summary=self._final_summary,
+            poll_exit_response=self._poll_exit_response,
+            server_info_response=self._server_info_response,
+            check_version_response=self._check_version,
+            internal_messages_response=self._internal_messages_response,
+            job_info=self._job_info,
+            reporter=self._reporter,
+            quiet=self._quiet,
             settings=self._settings,
             printer=self._printer,
         )
@@ -2489,16 +2594,12 @@ class Run:
             if arg_val is not None and not isinstance(arg_val, exp_type):
                 arg_type = type(arg_val).__name__
                 raise wandb.Error(
-                    "Unhandled define_metric() arg: {} type: {}".format(
-                        arg_name, arg_type
-                    )
+                    f"Unhandled define_metric() arg: {arg_name} type: {arg_type}"
                 )
         stripped = name[:-1] if name.endswith("*") else name
         if "*" in stripped:
             raise wandb.Error(
-                "Unhandled define_metric() arg: name (glob suffixes only): {}".format(
-                    name
-                )
+                f"Unhandled define_metric() arg: name (glob suffixes only): {name}"
             )
         summary_ops: Optional[Sequence[str]] = None
         if summary:
@@ -2590,7 +2691,7 @@ class Run:
     @_run_decorator._attach
     def link_artifact(
         self,
-        artifact: Union[PublicArtifact, LocalArtifact],
+        artifact: Artifact,
         target_path: str,
         aliases: Optional[List[str]] = None,
     ) -> None:
@@ -2615,7 +2716,7 @@ class Run:
             aliases = []
 
         if self._backend and self._backend.interface:
-            if isinstance(artifact, LocalArtifact) and not artifact._logged_artifact:
+            if artifact.is_draft() and not artifact._is_draft_save_started():
                 artifact = self._log_artifact(artifact)
             if not self._settings._offline:
                 self._backend.interface.publish_link_artifact(
@@ -2626,6 +2727,10 @@ class Run:
                     entity,
                     project,
                 )
+                if artifact._ttl_duration_seconds is not None:
+                    wandb.termwarn(
+                        "Artifact TTL will be disabled for source artifacts that are linked to portfolios."
+                    )
             else:
                 # TODO: implement offline mode + sync
                 raise NotImplementedError
@@ -2634,11 +2739,11 @@ class Run:
     @_run_decorator._attach
     def use_artifact(
         self,
-        artifact_or_name: Union[str, PublicArtifact, LocalArtifact],
+        artifact_or_name: Union[str, Artifact],
         type: Optional[str] = None,
         aliases: Optional[List[str]] = None,
         use_as: Optional[str] = None,
-    ) -> Union[PublicArtifact, LocalArtifact]:
+    ) -> Artifact:
         """Declare an artifact as an input to a run.
 
         Call `download` or `file` on the returned object to get the contents locally.
@@ -2703,10 +2808,10 @@ class Run:
                 aliases = []
             elif isinstance(aliases, str):
                 aliases = [aliases]
-            if isinstance(artifact_or_name, wandb.Artifact):
+            if isinstance(artifact_or_name, Artifact) and artifact.is_draft():
                 if use_as is not None:
                     wandb.termwarn(
-                        "Indicating use_as is not supported when using an artifact with an instance of `wandb.Artifact`"
+                        "Indicating use_as is not supported when using a draft artifact"
                     )
                 self._log_artifact(
                     artifact,
@@ -2716,13 +2821,13 @@ class Run:
                 )
                 artifact.wait()
                 artifact._use_as = use_as or artifact.name
-            elif isinstance(artifact, PublicArtifact):
+            elif isinstance(artifact, Artifact) and not artifact.is_draft():
                 if (
                     self._launch_artifact_mapping
                     and artifact.name in self._launch_artifact_mapping.keys()
                 ):
                     wandb.termwarn(
-                        "Swapping artifacts is not supported when using an instance of `PublicArtifact`. "
+                        "Swapping artifacts is not supported when using a non-draft artifact. "
                         f"Using {artifact.name}."
                     )
                 artifact._use_as = use_as or artifact.name
@@ -2742,11 +2847,11 @@ class Run:
     @_run_decorator._attach
     def log_artifact(
         self,
-        artifact_or_path: Union[LocalArtifact, StrPath],
+        artifact_or_path: Union[Artifact, StrPath],
         name: Optional[str] = None,
         type: Optional[str] = None,
         aliases: Optional[List[str]] = None,
-    ) -> LocalArtifact:
+    ) -> Artifact:
         """Declare an artifact as an output of a run.
 
         Arguments:
@@ -2779,12 +2884,12 @@ class Run:
     @_run_decorator._attach
     def upsert_artifact(
         self,
-        artifact_or_path: Union[LocalArtifact, str],
+        artifact_or_path: Union[Artifact, str],
         name: Optional[str] = None,
         type: Optional[str] = None,
         aliases: Optional[List[str]] = None,
         distributed_id: Optional[str] = None,
-    ) -> LocalArtifact:
+    ) -> Artifact:
         """Declare (or append to) a non-finalized artifact as output of a run.
 
         Note that you must call run.finish_artifact() to finalize the artifact.
@@ -2833,12 +2938,12 @@ class Run:
     @_run_decorator._attach
     def finish_artifact(
         self,
-        artifact_or_path: Union[LocalArtifact, str],
+        artifact_or_path: Union[Artifact, str],
         name: Optional[str] = None,
         type: Optional[str] = None,
         aliases: Optional[List[str]] = None,
         distributed_id: Optional[str] = None,
-    ) -> LocalArtifact:
+    ) -> Artifact:
         """Finishes a non-finalized artifact as output of a run.
 
         Subsequent "upserts" with the same distributed ID will result in a new version.
@@ -2885,7 +2990,7 @@ class Run:
 
     def _log_artifact(
         self,
-        artifact_or_path: Union[LocalArtifact, StrPath],
+        artifact_or_path: Union[Artifact, StrPath],
         name: Optional[str] = None,
         type: Optional[str] = None,
         aliases: Optional[List[str]] = None,
@@ -2893,7 +2998,7 @@ class Run:
         finalize: bool = True,
         is_user_created: bool = False,
         use_after_commit: bool = False,
-    ) -> LocalArtifact:
+    ) -> Artifact:
         api = internal.Api()
         if api.settings().get("anonymous") == "true":
             wandb.termwarn(
@@ -2922,7 +3027,7 @@ class Run:
                     is_user_created=is_user_created,
                     use_after_commit=use_after_commit,
                 )
-                artifact._logged_artifact = LazyArtifact(self._public_api(), future)
+                artifact._set_save_future(future, self._public_api().client)
             else:
                 self._backend.interface.publish_artifact(
                     self,
@@ -2952,42 +3057,52 @@ class Run:
 
     # TODO(jhr): annotate this
     def _assert_can_log_artifact(self, artifact) -> None:  # type: ignore
-        if not self._settings._offline:
-            try:
-                public_api = self._public_api()
-                expected_type = PublicArtifact.expected_type(
-                    public_api.client,
-                    artifact.name,
-                    public_api.settings["entity"],
-                    public_api.settings["project"],
-                )
-            except requests.exceptions.RequestException:
-                # Just return early if there is a network error. This is
-                # ok, as this function is intended to help catch an invalid
-                # type early, but not a hard requirement for valid operation.
-                return
-            if expected_type is not None and artifact.type != expected_type:
-                raise ValueError(
-                    f"Artifact {artifact.name} already exists with type {expected_type}; "
-                    f"cannot create another with type {artifact.type}"
-                )
+        if self._settings._offline:
+            return
+        try:
+            public_api = self._public_api()
+            entity = public_api.settings["entity"]
+            project = public_api.settings["project"]
+            expected_type = Artifact._expected_type(
+                entity, project, artifact.name, public_api.client
+            )
+        except requests.exceptions.RequestException:
+            # Just return early if there is a network error. This is
+            # ok, as this function is intended to help catch an invalid
+            # type early, but not a hard requirement for valid operation.
+            return
+        if expected_type is not None and artifact.type != expected_type:
+            raise ValueError(
+                f"Artifact {artifact.name} already exists with type '{expected_type}'; "
+                f"cannot create another with type '{artifact.type}'"
+            )
+        if entity and artifact._source_entity and entity != artifact._source_entity:
+            raise ValueError(
+                f"Artifact {artifact.name} is owned by entity '{entity}'; it can't be "
+                f"moved to '{artifact._source_entity}'"
+            )
+        if project and artifact._source_project and project != artifact._source_project:
+            raise ValueError(
+                f"Artifact {artifact.name} exists in project '{project}'; it can't be "
+                f"moved to '{artifact._source_project}'"
+            )
 
     def _prepare_artifact(
         self,
-        artifact_or_path: Union[LocalArtifact, StrPath],
+        artifact_or_path: Union[Artifact, StrPath],
         name: Optional[str] = None,
         type: Optional[str] = None,
         aliases: Optional[List[str]] = None,
-    ) -> Tuple[LocalArtifact, List[str]]:
+    ) -> Tuple[Artifact, List[str]]:
         if isinstance(artifact_or_path, (str, os.PathLike)):
             name = name or f"run-{self._run_id}-{os.path.basename(artifact_or_path)}"
             artifact = wandb.Artifact(name, type or "unspecified")
             if os.path.isfile(artifact_or_path):
-                artifact.add_file(artifact_or_path)
+                artifact.add_file(str(artifact_or_path))
             elif os.path.isdir(artifact_or_path):
-                artifact.add_dir(artifact_or_path)
+                artifact.add_dir(str(artifact_or_path))
             elif "://" in str(artifact_or_path):
-                artifact.add_reference(artifact_or_path)
+                artifact.add_reference(str(artifact_or_path))
             else:
                 raise ValueError(
                     "path must be a file, directory or external"
@@ -3002,6 +3117,205 @@ class Run:
             )
         artifact.finalize()
         return artifact, _resolve_aliases(aliases)
+
+    @_run_decorator._noop_on_finish()
+    @_run_decorator._attach
+    def log_model(
+        self,
+        path: StrPath,
+        name: Optional[str] = None,
+        aliases: Optional[List[str]] = None,
+    ) -> None:
+        """Logs a model artifact containing the contents inside the 'path' to a run and marks it as an output to this run.
+
+        Arguments:
+            path: (str) A path to the contents of this model,
+                can be in the following forms:
+                    - `/local/directory`
+                    - `/local/directory/file.txt`
+                    - `s3://bucket/path`
+            name: (str, optional) A name to assign to the model artifact that the file contents will be added to.
+                The string must contain only the following alphanumeric characters: dashes, underscores, and dots.
+                This will default to the basename of the path prepended with the current
+                run id  if not specified.
+            aliases: (list, optional) Aliases to apply to the created model artifact,
+                    defaults to `["latest"]`
+
+        Examples:
+            ```python
+            run.log_model(
+                path="/local/directory",
+                name="my_model_artifact",
+                aliases=["production"],
+            )
+            ```
+
+            Invalid usage
+            ```python
+            run.log_model(
+                path="/local/directory",
+                name="my_entity/my_project/my_model_artifact",
+                aliases=["production"],
+            )
+            ```
+
+        Raises:
+            ValueError: if name has invalid special characters
+
+        Returns:
+            None
+        """
+        self._log_artifact(
+            artifact_or_path=path, name=name, type="model", aliases=aliases
+        )
+
+    @_run_decorator._noop_on_finish()
+    @_run_decorator._attach
+    def use_model(self, name: str) -> FilePathStr:
+        """Download the files logged in a model artifact 'name'.
+
+        Arguments:
+            name: (str) A model artifact name. 'name' must match the name of an existing logged
+                model artifact.
+                May be prefixed with entity/project/. Valid names
+                can be in the following forms:
+                    - model_artifact_name:version
+                    - model_artifact_name:alias
+                    - model_artifact_name:digest.
+
+        Examples:
+            ```python
+            run.use_model(
+                name="my_model_artifact:latest",
+            )
+
+            run.use_model(
+                name="my_project/my_model_artifact:v0",
+            )
+
+            run.use_model(
+                name="my_entity/my_project/my_model_artifact:<digest>",
+            )
+            ```
+
+            Invalid usage
+            ```python
+            run.use_model(
+                name="my_entity/my_project/my_model_artifact",
+            )
+            ```
+
+        Raises:
+            AssertionError: if model artifact 'name' is of a type that does not contain the substring 'model'.
+
+        Returns:
+            path: (str) path to downloaded model artifact file(s).
+        """
+        artifact = self.use_artifact(artifact_or_name=name)
+        assert "model" in str(
+            artifact.type.lower()
+        ), "You can only use this method for 'model' artifacts. For an artifact to be a 'model' artifact, its type property must contain the substring 'model'."
+        path = artifact.download()
+
+        # If returned directory contains only one file, return path to that file
+        dir_list = os.listdir(path)
+        if len(dir_list) == 1:
+            return FilePathStr(os.path.join(path, dir_list[0]))
+        return path
+
+    @_run_decorator._noop_on_finish()
+    @_run_decorator._attach
+    def link_model(
+        self,
+        path: StrPath,
+        registered_model_name: str,
+        name: Optional[str] = None,
+        aliases: Optional[List[str]] = None,
+    ) -> None:
+        """Log a model artifact version and link it to a registered model in the model registry.
+
+        The linked model version will be visible in the UI for the specified registered model.
+
+        Steps:
+            - Check if 'name' model artifact has been logged. If so, use the artifact version that matches the files
+            located at 'path' or log a new version. Otherwise log files under 'path' as a new model artifact, 'name'
+            of type 'model'.
+            - Check if registered model with name 'registered_model_name' exists in the 'model-registry' project.
+            If not, create a new registered model with name 'registered_model_name'.
+            - Link version of model artifact 'name' to registered model, 'registered_model_name'.
+            - Attach aliases from 'aliases' list to the newly linked model artifact version.
+
+        Arguments:
+            path: (str) A path to the contents of this model,
+                can be in the following forms:
+                    - `/local/directory`
+                    - `/local/directory/file.txt`
+                    - `s3://bucket/path`
+            registered_model_name: (str) - the name of the registered model that the model is to be linked to.
+                A registered model is a collection of model versions linked to the model registry, typically representing a
+                team's specific ML Task. The entity that this registered model belongs to will be derived from the run
+                name: (str, optional) - the name of the model artifact that files in 'path' will be logged to. This will
+                default to the basename of the path prepended with the current run id  if not specified.
+            aliases: (List[str], optional) - alias(es) that will only be applied on this linked artifact
+                inside the registered model.
+                The alias "latest" will always be applied to the latest version of an artifact that is linked.
+
+        Examples:
+            ```python
+            run.link_model(
+                path="/local/directory",
+                registered_model_name="my_reg_model",
+                name="my_model_artifact",
+                aliases=["production"],
+            )
+            ```
+
+            Invalid usage
+            ```python
+            run.link_model(
+                path="/local/directory",
+                registered_model_name="my_entity/my_project/my_reg_model",
+                name="my_model_artifact",
+                aliases=["production"],
+            )
+
+            run.link_model(
+                path="/local/directory",
+                registered_model_name="my_reg_model",
+                name="my_entity/my_project/my_model_artifact",
+                aliases=["production"],
+            )
+            ```
+
+        Raises:
+            AssertionError: if registered_model_name is a path or
+                if model artifact 'name' is of a type that does not contain the substring 'model'
+            ValueError: if name has invalid special characters
+
+        Returns:
+            None
+        """
+        name_parts = registered_model_name.split("/")
+        assert (
+            len(name_parts) == 1
+        ), "Please provide only the name of the registered model. Do not append the entity or project name."
+        project = "model-registry"
+        target_path = self.entity + "/" + project + "/" + registered_model_name
+
+        public_api = self._public_api()
+        try:
+            artifact = public_api.artifact(name=f"{name}:latest")
+            assert "model" in str(
+                artifact.type.lower()
+            ), "You can only use this method for 'model' artifacts. For an artifact to be a 'model' artifact, its type property must contain the substring 'model'."
+            artifact = self._log_artifact(
+                artifact_or_path=path, name=name, type=artifact.type
+            )
+        except (ValueError, wandb.CommError):
+            artifact = self._log_artifact(
+                artifact_or_path=path, name=name, type="model"
+            )
+        self.link_artifact(artifact=artifact, target_path=target_path, aliases=aliases)
 
     @_run_decorator._noop_on_finish()
     @_run_decorator._attach
@@ -3047,9 +3361,12 @@ class Run:
         exc_val: BaseException,
         exc_tb: TracebackType,
     ) -> bool:
-        exit_code = 0 if exc_type is None else 1
-        self._finish(exit_code)
-        return exc_type is None
+        exception_raised = exc_type is not None
+        if exception_raised:
+            traceback.print_exception(exc_type, exc_val, exc_tb)
+        exit_code = 1 if exception_raised else 0
+        self._finish(exit_code=exit_code)
+        return not exception_raised
 
     @_run_decorator._noop_on_finish()
     @_run_decorator._attach
@@ -3060,6 +3377,51 @@ class Run:
         """
         if self._backend and self._backend.interface:
             self._backend.interface.publish_preempting()
+
+    @property
+    @_run_decorator._noop_on_finish()
+    @_run_decorator._attach
+    def _system_metrics(self) -> Dict[str, List[Tuple[datetime, float]]]:
+        """Returns a dictionary of system metrics.
+
+        Returns:
+            A dictionary of system metrics.
+        """
+
+        def pb_to_dict(
+            system_metrics_pb: wandb.proto.wandb_internal_pb2.GetSystemMetricsResponse,
+        ) -> Dict[str, List[Tuple[datetime, float]]]:
+            res = {}
+
+            for metric, records in system_metrics_pb.system_metrics.items():
+                measurements = []
+                for record in records.record:
+                    # Convert timestamp to datetime
+                    dt = datetime.fromtimestamp(
+                        record.timestamp.seconds, tz=timezone.utc
+                    )
+                    dt = dt.replace(microsecond=record.timestamp.nanos // 1000)
+
+                    measurements.append((dt, record.value))
+
+                res[metric] = measurements
+
+            return res
+
+        if not self._backend or not self._backend.interface:
+            return {}
+
+        handle = self._backend.interface.deliver_get_system_metrics()
+        result = handle.wait(timeout=1)
+
+        if result:
+            try:
+                response = result.response.get_system_metrics_response
+                if response:
+                    return pb_to_dict(response)
+            except Exception as e:
+                logger.error("Error getting system metrics: %s", e)
+        return {}
 
     # ------------------------------------------------------------------------------
     # HEADER
@@ -3209,7 +3571,9 @@ class Run:
         final_summary: Optional["GetSummaryResponse"] = None,
         poll_exit_response: Optional[PollExitResponse] = None,
         server_info_response: Optional[ServerInfoResponse] = None,
-        check_version: Optional["CheckVersionResponse"] = None,
+        check_version_response: Optional["CheckVersionResponse"] = None,
+        internal_messages_response: Optional["InternalMessagesResponse"] = None,
+        job_info: Optional["JobInfoResponse"] = None,
         reporter: Optional[Reporter] = None,
         quiet: Optional[bool] = None,
         *,
@@ -3226,16 +3590,26 @@ class Run:
 
         Run._footer_sync_info(
             poll_exit_response=poll_exit_response,
+            job_info=job_info,
             quiet=quiet,
             settings=settings,
             printer=printer,
         )
         Run._footer_log_dir_info(quiet=quiet, settings=settings, printer=printer)
         Run._footer_version_check_info(
-            check_version=check_version, quiet=quiet, settings=settings, printer=printer
+            check_version=check_version_response,
+            quiet=quiet,
+            settings=settings,
+            printer=printer,
         )
         Run._footer_local_warn(
             server_info_response=server_info_response,
+            quiet=quiet,
+            settings=settings,
+            printer=printer,
+        )
+        Run._footer_internal_messages(
+            internal_messages_response=internal_messages_response,
             quiet=quiet,
             settings=settings,
             printer=printer,
@@ -3302,7 +3676,7 @@ class Run:
                     poll_exit_responses_list, printer=printer
                 )
         else:
-            raise ValueError(
+            logger.error(
                 f"Got the type `{type(poll_exit_responses)}` for `poll_exit_responses`. "
                 "Expected either None, PollExitResponse or a List[Union[PollExitResponse, None]]"
             )
@@ -3321,10 +3695,11 @@ class Run:
         done = poll_exit_response.done
 
         megabyte = wandb.util.POW_2_BYTES[2][1]
-        line = (
-            f"{progress.uploaded_bytes / megabyte :.3f} MB of {progress.total_bytes / megabyte:.3f} MB uploaded "
-            f"({progress.deduped_bytes / megabyte:.3f} MB deduped)\r"
-        )
+        line = f"{progress.uploaded_bytes / megabyte :.3f} MB of {progress.total_bytes / megabyte:.3f} MB uploaded"
+        if progress.deduped_bytes > 0:
+            line += f" ({progress.deduped_bytes / megabyte:.3f} MB deduped)\r"
+        else:
+            line += "\r"
 
         percent_done = (
             1.0
@@ -3385,7 +3760,7 @@ class Run:
             f"({uploaded/megabyte :.2f} MB/{total/megabyte :.2f} MB)\r"
         )
         # line = "{}{:<{max_len}}\r".format(line, " ", max_len=(80 - len(line)))
-        printer.progress_update(line)  # type: ignore [call-arg]
+        printer.progress_update(line)  # type:ignore[call-arg]
 
         done = all(
             [
@@ -3400,6 +3775,7 @@ class Run:
     @staticmethod
     def _footer_sync_info(
         poll_exit_response: Optional[PollExitResponse] = None,
+        job_info: Optional["JobInfoResponse"] = None,
         quiet: Optional[bool] = None,
         *,
         settings: "Settings",
@@ -3422,6 +3798,11 @@ class Run:
                 info = [
                     f"{printer.emoji('rocket')} View run {printer.name(settings.run_name)} at: {printer.link(settings.run_url)}"
                 ]
+            if job_info and job_info.version and job_info.sequenceId:
+                link = f"{settings.project_url}/jobs/{job_info.sequenceId}/version_details/{job_info.version}"
+                info.append(
+                    f"{printer.emoji('lightning')} View job at {printer.link(link)}",
+                )
             if poll_exit_response and poll_exit_response.file_counts:
                 logger.info("logging synced files")
                 file_counts = poll_exit_response.file_counts
@@ -3545,6 +3926,23 @@ class Run:
                     f"Learn more: {printer.link(wburls.get('upgrade_server'))}",
                     level="warn",
                 )
+
+    @staticmethod
+    def _footer_internal_messages(
+        internal_messages_response: Optional["InternalMessagesResponse"] = None,
+        quiet: Optional[bool] = None,
+        *,
+        settings: "Settings",
+        printer: Union["PrinterTerm", "PrinterJupyter"],
+    ) -> None:
+        if (quiet or settings.quiet) or settings.silent:
+            return
+
+        if not internal_messages_response:
+            return
+
+        for message in internal_messages_response.messages.warning:
+            printer.display(message, level="warn")
 
     @staticmethod
     def _footer_server_messages(

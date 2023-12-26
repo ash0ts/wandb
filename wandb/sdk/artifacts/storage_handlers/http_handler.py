@@ -3,8 +3,8 @@ import os
 from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple, Union
 from urllib.parse import ParseResult
 
+from wandb.sdk.artifacts.artifact_file_cache import get_artifact_file_cache
 from wandb.sdk.artifacts.artifact_manifest_entry import ArtifactManifestEntry
-from wandb.sdk.artifacts.artifacts_cache import get_artifacts_cache
 from wandb.sdk.artifacts.storage_handler import StorageHandler
 from wandb.sdk.internal.thread_local_settings import _thread_local_api_settings
 from wandb.sdk.lib.hashutil import ETag
@@ -13,7 +13,7 @@ from wandb.sdk.lib.paths import FilePathStr, StrPath, URIStr
 if TYPE_CHECKING:
     import requests
 
-    from wandb.sdk.artifacts.artifact import Artifact as ArtifactInterface
+    from wandb.sdk.artifacts.artifact import Artifact
 
 
 class HTTPHandler(StorageHandler):
@@ -21,7 +21,7 @@ class HTTPHandler(StorageHandler):
         self, session: "requests.Session", scheme: Optional[str] = None
     ) -> None:
         self._scheme = scheme or "http"
-        self._cache = get_artifacts_cache()
+        self._cache = get_artifact_file_cache()
         self._session = session
 
     def can_handle(self, parsed_url: "ParseResult") -> bool:
@@ -69,7 +69,7 @@ class HTTPHandler(StorageHandler):
 
     def store_path(
         self,
-        artifact: "ArtifactInterface",
+        artifact: "Artifact",
         path: Union[URIStr, FilePathStr],
         name: Optional[StrPath] = None,
         checksum: bool = True,

@@ -1,6 +1,5 @@
 import os
 import shutil
-import sys
 import unittest.mock
 from pathlib import Path
 from queue import Queue
@@ -52,8 +51,7 @@ def copy_asset(assets_path) -> Generator[Callable, None, None]:
 
 @pytest.fixture(scope="function", autouse=True)
 def filesystem_isolate(tmp_path):
-    # Click>=8 implements temp_dir argument which depends on python>=3.7
-    kwargs = dict(temp_dir=tmp_path) if sys.version_info >= (3, 7) else {}
+    kwargs = dict(temp_dir=tmp_path)
     with CliRunner().isolated_filesystem(**kwargs):
         yield
 
@@ -210,7 +208,7 @@ def test_settings():
     def update_test_settings(
         extra_settings: Union[
             dict, wandb.sdk.wandb_settings.Settings
-        ] = dict_factory()  # noqa: B008
+        ] = dict_factory(),  # noqa: B008
     ):
         settings = wandb.Settings(
             console="off",
@@ -249,3 +247,19 @@ def mock_run(test_settings, mocked_backend) -> Generator[Callable, None, None]:
 
     yield mock_run_fn
     unset_globals()
+
+
+@pytest.fixture
+def example_file(tmp_path: Path) -> Path:
+    new_file = tmp_path / "test.txt"
+    new_file.write_text("hello")
+    return new_file
+
+
+@pytest.fixture
+def example_files(tmp_path: Path) -> Path:
+    artifact_dir = tmp_path / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    for i in range(3):
+        (artifact_dir / f"artifact_{i}.txt").write_text(f"file-{i}")
+    return artifact_dir

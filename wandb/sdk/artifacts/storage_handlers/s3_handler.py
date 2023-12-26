@@ -1,5 +1,4 @@
 """S3 storage handler."""
-import base64
 import os
 import time
 from pathlib import PurePosixPath
@@ -9,8 +8,8 @@ from urllib.parse import parse_qsl, urlparse
 from wandb import util
 from wandb.errors import CommError
 from wandb.errors.term import termlog
+from wandb.sdk.artifacts.artifact_file_cache import get_artifact_file_cache
 from wandb.sdk.artifacts.artifact_manifest_entry import ArtifactManifestEntry
-from wandb.sdk.artifacts.artifacts_cache import get_artifacts_cache
 from wandb.sdk.artifacts.storage_handler import DEFAULT_MAX_OBJECTS, StorageHandler
 from wandb.sdk.lib.hashutil import ETag
 from wandb.sdk.lib.paths import FilePathStr, StrPath, URIStr
@@ -27,19 +26,17 @@ if TYPE_CHECKING:
     import boto3.s3  # type: ignore
     import boto3.session  # type: ignore
 
-    from wandb.sdk.artifacts.artifact import Artifact as ArtifactInterface
+    from wandb.sdk.artifacts.artifact import Artifact
 
 
 class S3Handler(StorageHandler):
     _s3: Optional["boto3.resources.base.ServiceResource"]
     _scheme: str
-    _versioning_enabled: Optional[bool]
 
     def __init__(self, scheme: Optional[str] = None) -> None:
         self._scheme = scheme or "s3"
         self._s3 = None
-        self._versioning_enabled = None
-        self._cache = get_artifacts_cache()
+        self._cache = get_artifact_file_cache()
 
     def can_handle(self, parsed_url: "ParseResult") -> bool:
         return parsed_url.scheme == self._scheme
@@ -47,7 +44,7 @@ class S3Handler(StorageHandler):
     def init_boto(self) -> "boto3.resources.base.ServiceResource":
         if self._s3 is not None:
             return self._s3
-        boto: "boto3" = util.get_module(
+        boto: boto3 = util.get_module(
             "boto3",
             required="s3:// references requires the boto3 library, run pip install wandb[aws]",
             lazy=False,
@@ -69,15 +66,6 @@ class S3Handler(StorageHandler):
         version = query.get("versionId")
 
         return bucket, key, version
-
-    def versioning_enabled(self, bucket: str) -> bool:
-        self.init_boto()
-        assert self._s3 is not None  # mypy: unwraps optionality
-        if self._versioning_enabled is not None:
-            return self._versioning_enabled
-        res = self._s3.BucketVersioning(bucket)
-        self._versioning_enabled = res.status == "Enabled"
-        return self._versioning_enabled
 
     def load_path(
         self,
@@ -104,39 +92,42 @@ class S3Handler(StorageHandler):
         version = manifest_entry.extra.get("versionID")
 
         extra_args = {}
-        if version is None:
-            # We don't have version information so just get the latest version
-            # and fallback to listing all versions if we don't have a match.
-            obj = self._s3.Object(bucket, key)
-            etag = self._etag_from_obj(obj)
-            if etag != manifest_entry.digest:
-                if self.versioning_enabled(bucket):
-                    # Fallback to listing versions
-                    obj = None
-                    object_versions = self._s3.Bucket(bucket).object_versions.filter(
-                        Prefix=key
-                    )
-                    for object_version in object_versions:
-                        if (
-                            manifest_entry.extra.get("etag")
-                            == object_version.e_tag[1:-1]
-                        ):
-                            obj = object_version.Object()
-                            extra_args["VersionId"] = object_version.version_id
-                            break
-                    if obj is None:
-                        raise ValueError(
-                            "Couldn't find object version for {}/{} matching etag {}".format(
-                                bucket, key, manifest_entry.extra.get("etag")
-                            )
-                        )
-                else:
-                    raise ValueError(
-                        f"Digest mismatch for object {manifest_entry.ref}: expected {manifest_entry.digest} but found {etag}"
-                    )
-        else:
+        if version:
             obj = self._s3.ObjectVersion(bucket, key, version).Object()
             extra_args["VersionId"] = version
+        else:
+            obj = self._s3.Object(bucket, key)
+
+        try:
+            etag = self._etag_from_obj(obj)
+        except self._botocore.exceptions.ClientError as e:
+            if e.response["Error"]["Code"] == "404":
+                raise FileNotFoundError(
+                    f"Unable to find {manifest_entry.path} at s3://{bucket}/{key}"
+                ) from e
+            raise
+
+        if etag != manifest_entry.digest:
+            # Try to match the etag with some other version.
+            if version:
+                raise ValueError(
+                    f"Digest mismatch for object {manifest_entry.ref} with version {version}: expected {manifest_entry.digest} but found {etag}"
+                )
+            obj = None
+            object_versions = self._s3.Bucket(bucket).object_versions.filter(Prefix=key)
+            for object_version in object_versions:
+                if manifest_entry.extra.get("etag") == self._etag_from_obj(
+                    object_version
+                ):
+                    obj = object_version.Object()
+                    extra_args["VersionId"] = object_version.version_id
+                    break
+            if obj is None:
+                raise FileNotFoundError(
+                    "Couldn't find object version for {}/{} matching etag {}".format(
+                        bucket, key, manifest_entry.extra.get("etag")
+                    )
+                )
 
         with cache_open(mode="wb") as f:
             obj.download_fileobj(f, ExtraArgs=extra_args)
@@ -144,7 +135,7 @@ class S3Handler(StorageHandler):
 
     def store_path(
         self,
-        artifact: "ArtifactInterface",
+        artifact: "Artifact",
         path: Union[URIStr, FilePathStr],
         name: Optional[StrPath] = None,
         checksum: bool = True,
@@ -159,14 +150,11 @@ class S3Handler(StorageHandler):
         # metadata in the artifact entry itself.
         bucket, key, version = self._parse_uri(path)
         path = URIStr(f"{self._scheme}://{bucket}/{key}")
-        if not self.versioning_enabled(bucket) and version:
-            raise ValueError(
-                f"Specifying a versionId is not valid for s3://{bucket} as it does not have versioning enabled."
-            )
 
         max_objects = max_objects or DEFAULT_MAX_OBJECTS
         if not checksum:
-            return [ArtifactManifestEntry(path=name or key, ref=path, digest=path)]
+            entry_path = name or (key if key != "" else bucket)
+            return [ArtifactManifestEntry(path=entry_path, ref=path, digest=path)]
 
         # If an explicit version is specified, use that. Otherwise, use the head version.
         objs = (
@@ -176,30 +164,41 @@ class S3Handler(StorageHandler):
         )
         start_time = None
         multi = False
-        try:
-            objs[0].load()
-            # S3 doesn't have real folders, however there are cases where the folder key has a valid file which will not
-            # trigger a recursive upload.
-            # we should check the object's metadata says it is a directory and do a multi file upload if it is
-            if "x-directory" in objs[0].content_type:
-                multi = True
-        except self._botocore.exceptions.ClientError as e:
-            if e.response["Error"]["Code"] == "404":
-                multi = True
-            else:
-                raise CommError(
-                    "Unable to connect to S3 ({}): {}".format(
-                        e.response["Error"]["Code"], e.response["Error"]["Message"]
+        if key != "":
+            try:
+                objs[0].load()
+                # S3 doesn't have real folders, however there are cases where the folder key has a valid file which will not
+                # trigger a recursive upload.
+                # we should check the object's metadata says it is a directory and do a multi file upload if it is
+                if "x-directory" in objs[0].content_type:
+                    multi = True
+            except self._botocore.exceptions.ClientError as e:
+                if e.response["Error"]["Code"] == "404":
+                    multi = True
+                else:
+                    raise CommError(
+                        "Unable to connect to S3 ({}): {}".format(
+                            e.response["Error"]["Code"], e.response["Error"]["Message"]
+                        )
                     )
-                )
+        else:
+            multi = True
+
         if multi:
             start_time = time.time()
             termlog(
-                'Generating checksum for up to %i objects with prefix "%s"... '
-                % (max_objects, key),
+                'Generating checksum for up to %i objects in "%s/%s"... '
+                % (max_objects, bucket, key),
                 newline=False,
             )
-            objs = self._s3.Bucket(bucket).objects.filter(Prefix=key).limit(max_objects)
+            if key != "":
+                objs = (
+                    self._s3.Bucket(bucket)
+                    .objects.filter(Prefix=key)
+                    .limit(max_objects)
+                )
+            else:
+                objs = self._s3.Bucket(bucket).objects.limit(max_objects)
         # Weird iterator scoping makes us assign this to a local function
         size = self._size_from_obj
         entries = [
@@ -216,7 +215,9 @@ class S3Handler(StorageHandler):
             )
         return entries
 
-    def _size_from_obj(self, obj: "boto3.s3.Object") -> int:
+    def _size_from_obj(
+        self, obj: Union["boto3.s3.Object", "boto3.s3.ObjectSummary"]
+    ) -> int:
         # ObjectSummary has size, Object has content_length
         size: int
         if hasattr(obj, "size"):
@@ -227,7 +228,7 @@ class S3Handler(StorageHandler):
 
     def _entry_from_obj(
         self,
-        obj: "boto3.s3.Object",
+        obj: Union["boto3.s3.Object", "boto3.s3.ObjectSummary"],
         path: str,
         name: Optional[StrPath] = None,
         prefix: str = "",
@@ -273,26 +274,20 @@ class S3Handler(StorageHandler):
         )
 
     @staticmethod
-    def _etag_from_obj(obj: "boto3.s3.Object") -> ETag:
+    def _etag_from_obj(obj: Union["boto3.s3.Object", "boto3.s3.ObjectSummary"]) -> ETag:
         etag: ETag
         etag = obj.e_tag[1:-1]  # escape leading and trailing quote
         return etag
 
-    @staticmethod
-    def _extra_from_obj(obj: "boto3.s3.Object") -> Dict[str, str]:
+    def _extra_from_obj(
+        self, obj: Union["boto3.s3.Object", "boto3.s3.ObjectSummary"]
+    ) -> Dict[str, str]:
         extra = {
             "etag": obj.e_tag[1:-1],  # escape leading and trailing quote
         }
-        # ObjectSummary will never have version_id
-        if hasattr(obj, "version_id") and obj.version_id != "null":
+        if not hasattr(obj, "version_id"):
+            # Convert ObjectSummary to Object to get the version_id.
+            obj = self._s3.Object(obj.bucket_name, obj.key)  # type: ignore[union-attr]
+        if hasattr(obj, "version_id") and obj.version_id and obj.version_id != "null":
             extra["versionID"] = obj.version_id
         return extra
-
-    @staticmethod
-    def _content_addressed_path(md5: str) -> FilePathStr:
-        # TODO: is this the structure we want? not at all human
-        # readable, but that's probably OK. don't want people
-        # poking around in the bucket
-        return FilePathStr(
-            "wandb/%s" % base64.b64encode(md5.encode("ascii")).decode("ascii")
-        )

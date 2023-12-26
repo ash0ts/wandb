@@ -64,7 +64,7 @@ def test_project_fill_macros():
     project = LaunchProject(
         job="mock-test-entity/mock-test-project/mock-test-job:v0",
         api=MagicMock(),
-        launch_spec={},
+        launch_spec={"author": "test-user"},
         target_entity="mock-test-entity",
         target_project="mock-test-project",
         docker_config={},
@@ -76,6 +76,7 @@ def test_project_fill_macros():
                 "labels": [
                     {"key": "wandb-project", "value": "${project_name}"},
                     {"key": "wandb-entity", "value": "${entity_name}"},
+                    {"key": "wandb-author", "value": "${author}"},
                 ],
                 "jobName": "launch-job-${run_id}",
                 "gpus": "${CUDA_VISIBLE_DEVICES}",
@@ -86,11 +87,12 @@ def test_project_fill_macros():
         name=None,
         run_id="my-run-id",
     )
-    project.fill_macros("my-custom-image")
-    assert project.resource_args["kubernetes"]["labels"] == [
+    resource_args = project.fill_macros("my-custom-image")
+    assert resource_args["kubernetes"]["labels"] == [
         {"key": "wandb-project", "value": "mock-test-project"},
         {"key": "wandb-entity", "value": "mock-test-entity"},
+        {"key": "wandb-author", "value": "test-user"},
     ]
-    assert project.resource_args["kubernetes"]["jobName"] == "launch-job-my-run-id"
-    assert project.resource_args["kubernetes"]["gpus"] == "0,1,2,3"
-    assert project.resource_args["kubernetes"]["image"] == "my-custom-image"
+    assert resource_args["kubernetes"]["jobName"] == "launch-job-my-run-id"
+    assert resource_args["kubernetes"]["gpus"] == "0,1,2,3"
+    assert resource_args["kubernetes"]["image"] == "my-custom-image"

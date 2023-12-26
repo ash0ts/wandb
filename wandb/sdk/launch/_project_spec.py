@@ -7,18 +7,21 @@ import json
 import logging
 import os
 import tempfile
-from typing import Any, Dict, List, Optional
+from copy import deepcopy
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, cast
 
 import wandb
 import wandb.docker as docker
 from wandb.apis.internal import Api
 from wandb.errors import CommError
-from wandb.sdk.artifacts.public_artifact import Artifact as PublicArtifact
 from wandb.sdk.launch import utils
 from wandb.sdk.lib.runid import generate_id
 
 from .errors import LaunchError
 from .utils import LOG_PREFIX, recursive_macro_sub
+
+if TYPE_CHECKING:
+    from wandb.sdk.artifacts.artifact import Artifact
 
 _logger = logging.getLogger(__name__)
 
@@ -69,7 +72,7 @@ class LaunchProject:
         self.job = job
         if job is not None:
             wandb.termlog(f"{LOG_PREFIX}Launching job: {job}")
-        self._job_artifact: Optional[PublicArtifact] = None
+        self._job_artifact: Optional[Artifact] = None
         self.api = api
         self.launch_spec = launch_spec
         self.target_entity = target_entity
@@ -78,14 +81,16 @@ class LaunchProject:
         # the builder key can be passed in through the resource args
         # but these resource_args are then passed to the appropriate
         # runner, so we need to pop the builder key out
-        resource_args_build = resource_args.get(resource, {}).pop("builder", {})
+        resource_args_copy = deepcopy(resource_args)
+        resource_args_build = resource_args_copy.get(resource, {}).pop("builder", {})
         self.resource = resource
-        self.resource_args = resource_args
+        self.resource_args = resource_args_copy
         self.sweep_id = sweep_id
+        self.author = launch_spec.get("author")
         self.python_version: Optional[str] = launch_spec.get("python_version")
-        self.cuda_base_image: Optional[str] = resource_args_build.get("cuda", {}).get(
-            "base_image"
-        )
+        self.accelerator_base_image: Optional[str] = resource_args_build.get(
+            "accelerator", {}
+        ).get("base_image") or resource_args_build.get("cuda", {}).get("base_image")
         self._base_image: Optional[str] = launch_spec.get("base_image")
         self.docker_image: Optional[str] = docker_config.get(
             "docker_image"
@@ -97,22 +102,30 @@ class LaunchProject:
         self.docker_user_id: int = docker_config.get("user_id", uid)
         self.git_version: Optional[str] = git_info.get("version")
         self.git_repo: Optional[str] = git_info.get("repo")
+        self.overrides = overrides
         self.override_args: List[str] = overrides.get("args", [])
         self.override_config: Dict[str, Any] = overrides.get("run_config", {})
         self.override_artifacts: Dict[str, Any] = overrides.get("artifacts", {})
         self.override_entrypoint: Optional[EntryPoint] = None
+        self.override_dockerfile: Optional[str] = overrides.get("dockerfile")
         self.deps_type: Optional[str] = None
         self._runtime: Optional[str] = None
         self.run_id = run_id or generate_id()
-        self._entry_points: Dict[
-            str, EntryPoint
-        ] = {}  # todo: keep multiple entrypoint support?
+        self._queue_name: Optional[str] = None
+        self._queue_entity: Optional[str] = None
+        self._run_queue_item_id: Optional[str] = None
+        self._entry_point: Optional[
+            EntryPoint
+        ] = None  # todo: keep multiple entrypoint support?
 
-        if overrides.get("entry_point"):
+        override_entrypoint = overrides.get("entry_point")
+        if override_entrypoint:
             _logger.info("Adding override entry point")
-            self.override_entrypoint = self.add_entry_point(
-                overrides.get("entry_point")  # type: ignore
+            self.override_entrypoint = EntryPoint(
+                name=self._get_entrypoint_file(override_entrypoint),
+                command=override_entrypoint,
             )
+
         if overrides.get("sweep_id") is not None:
             _logger.info("Adding override sweep id")
             self.sweep_id = overrides["sweep_id"]
@@ -178,7 +191,40 @@ class LaunchProject:
             assert self.job is not None
             return wandb.util.make_docker_image_name_safe(self.job.split(":")[0])
 
-    def fill_macros(self, image: str) -> None:
+    @property
+    def queue_name(self) -> Optional[str]:
+        return self._queue_name
+
+    @queue_name.setter
+    def queue_name(self, value: str) -> None:
+        self._queue_name = value
+
+    @property
+    def queue_entity(self) -> Optional[str]:
+        return self._queue_entity
+
+    @queue_entity.setter
+    def queue_entity(self, value: str) -> None:
+        self._queue_entity = value
+
+    @property
+    def run_queue_item_id(self) -> Optional[str]:
+        return self._run_queue_item_id
+
+    @run_queue_item_id.setter
+    def run_queue_item_id(self, value: str) -> None:
+        self._run_queue_item_id = value
+
+    def _get_entrypoint_file(self, entrypoint: List[str]) -> Optional[str]:
+        if not entrypoint:
+            return None
+        if entrypoint[0].endswith(".py") or entrypoint[0].endswith(".sh"):
+            return entrypoint[0]
+        if len(entrypoint) < 2:
+            return None
+        return entrypoint[1]
+
+    def fill_macros(self, image: str) -> Dict[str, Any]:
         """Substitute values for macros in resource arguments.
 
         Certain macros can be used in resource args. These macros allow the
@@ -211,9 +257,13 @@ class LaunchProject:
             "run_id": self.run_id,
             "run_name": self.name,
             "image_uri": image,
+            "author": self.author,
         }
         update_dict.update(os.environ)
-        self.resource_args = recursive_macro_sub(self.resource_args, update_dict)
+        result = recursive_macro_sub(self.resource_args, update_dict)
+        # recursive_macro_sub given a dict returns a dict with the same keys
+        # but with other input types behaves differently. The cast is for mypy.
+        return cast(Dict[str, Any], result)
 
     def build_required(self) -> bool:
         """Checks the source to see if a build is required."""
@@ -238,19 +288,21 @@ class LaunchProject:
         """Returns the first entrypoint for the project, or None if no entry point was provided because a docker image was provided."""
         # assuming project only has 1 entry point, pull that out
         # tmp fn until we figure out if we want to support multiple entry points or not
-        if not self._entry_points:
+        if not self._entry_point:
             if not self.docker_image:
                 raise LaunchError(
                     "Project must have at least one entry point unless docker image is specified."
                 )
             return None
-        return list(self._entry_points.values())[0]
+        return self._entry_point
 
-    def add_entry_point(self, command: List[str]) -> "EntryPoint":
+    def set_entry_point(self, command: List[str]) -> "EntryPoint":
         """Add an entry point to the project."""
-        entry_point = command[-1]
-        new_entrypoint = EntryPoint(name=entry_point, command=command)
-        self._entry_points[entry_point] = new_entrypoint
+        assert (
+            self._entry_point is None
+        ), "Cannot set entry point twice. Use LaunchProject.override_entrypoint"
+        new_entrypoint = EntryPoint(name=command[-1], command=command)
+        self._entry_point = new_entrypoint
         return new_entrypoint
 
     def _ensure_not_docker_image_and_local_process(self) -> None:
@@ -264,9 +316,10 @@ class LaunchProject:
         job_dir = tempfile.mkdtemp()
         try:
             job = public_api.job(self.job, path=job_dir)
-        except CommError:
+        except CommError as e:
+            msg = e.message
             raise LaunchError(
-                f"Job {self.job} not found. Jobs have the format: <entity>/<project>/<name>:<alias>"
+                f"Error accessing job {self.job}: {msg} on {public_api.settings.get('base_url')}"
             )
         job.configure_launch_project(self)
         self._job_artifact = job._job_artifact
@@ -372,7 +425,7 @@ class LaunchProject:
                 self.project_dir,
             )
 
-            if not self._entry_points:
+            if not self._entry_point:
                 _, ext = os.path.splitext(program_name)
                 if ext == ".py":
                     entry_point = ["python", program_name]
@@ -381,18 +434,18 @@ class LaunchProject:
                     entry_point = [command, program_name]
                 else:
                     raise LaunchError(f"Unsupported entrypoint: {program_name}")
-                self.add_entry_point(entry_point)
+                self.set_entry_point(entry_point)
             if not self.override_args:
                 self.override_args = run_info["args"]
         else:
             assert utils._GIT_URI_REGEX.match(self.uri), (
                 "Non-wandb URI %s should be a Git URI" % self.uri
             )
-            if not self._entry_points:
+            if not self._entry_point:
                 wandb.termlog(
                     f"{LOG_PREFIX}Entry point for repo not specified, defaulting to python main.py"
                 )
-                self.add_entry_point(EntrypointDefaults.PYTHON)
+                self.set_entry_point(EntrypointDefaults.PYTHON)
             branch_name = utils._fetch_git_repo(
                 self.project_dir, self.uri, self.git_version
             )
@@ -403,7 +456,7 @@ class LaunchProject:
 class EntryPoint:
     """An entry point into a wandb launch specification."""
 
-    def __init__(self, name: str, command: List[str]):
+    def __init__(self, name: Optional[str], command: List[str]):
         self.name = name
         self.command = command
 
@@ -411,7 +464,7 @@ class EntryPoint:
         """Converts user parameter dictionary to a string."""
         ret = self.command
         if user_parameters:
-            ret += user_parameters
+            return ret + user_parameters
         return ret
 
 
@@ -479,11 +532,11 @@ def fetch_and_validate_project(
     if launch_project.source == LaunchSource.DOCKER:
         return launch_project
     if launch_project.source == LaunchSource.LOCAL:
-        if not launch_project._entry_points:
+        if not launch_project._entry_point:
             wandb.termlog(
                 f"{LOG_PREFIX}Entry point for repo not specified, defaulting to `python main.py`"
             )
-            launch_project.add_entry_point(EntrypointDefaults.PYTHON)
+            launch_project.set_entry_point(EntrypointDefaults.PYTHON)
     elif launch_project.source == LaunchSource.JOB:
         launch_project._fetch_job()
     else:

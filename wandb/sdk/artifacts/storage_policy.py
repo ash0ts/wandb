@@ -5,18 +5,20 @@ from wandb.sdk.lib.paths import FilePathStr, URIStr
 
 if TYPE_CHECKING:
     from wandb.filesync.step_prepare import StepPrepare
-    from wandb.sdk.artifacts.artifact import Artifact as ArtifactInterface
+    from wandb.sdk.artifacts.artifact import Artifact
     from wandb.sdk.artifacts.artifact_manifest_entry import ArtifactManifestEntry
     from wandb.sdk.internal.progress import ProgressFn
 
 
 class StoragePolicy:
     @classmethod
-    def lookup_by_name(cls, name: str) -> Optional[Type["StoragePolicy"]]:
+    def lookup_by_name(cls, name: str) -> Type["StoragePolicy"]:
+        import wandb.sdk.artifacts.storage_policies  # noqa: F401
+
         for sub in cls.__subclasses__():
             if sub.name() == name:
                 return sub
-        return None
+        raise NotImplementedError(f"Failed to find storage policy '{name}'")
 
     @classmethod
     def name(cls) -> str:
@@ -30,7 +32,7 @@ class StoragePolicy:
         raise NotImplementedError
 
     def load_file(
-        self, artifact: "ArtifactInterface", manifest_entry: "ArtifactManifestEntry"
+        self, artifact: "Artifact", manifest_entry: "ArtifactManifestEntry"
     ) -> FilePathStr:
         raise NotImplementedError
 
@@ -57,7 +59,7 @@ class StoragePolicy:
 
     def store_reference(
         self,
-        artifact: "ArtifactInterface",
+        artifact: "Artifact",
         path: Union[URIStr, FilePathStr],
         name: Optional[str] = None,
         checksum: bool = True,

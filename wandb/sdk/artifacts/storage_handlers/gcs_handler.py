@@ -1,5 +1,4 @@
 """GCS storage handler."""
-import base64
 import time
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, Dict, Optional, Sequence, Tuple, Union
@@ -7,8 +6,8 @@ from urllib.parse import ParseResult, urlparse
 
 from wandb import util
 from wandb.errors.term import termlog
+from wandb.sdk.artifacts.artifact_file_cache import get_artifact_file_cache
 from wandb.sdk.artifacts.artifact_manifest_entry import ArtifactManifestEntry
-from wandb.sdk.artifacts.artifacts_cache import get_artifacts_cache
 from wandb.sdk.artifacts.storage_handler import DEFAULT_MAX_OBJECTS, StorageHandler
 from wandb.sdk.lib.hashutil import B64MD5
 from wandb.sdk.lib.paths import FilePathStr, StrPath, URIStr
@@ -16,28 +15,16 @@ from wandb.sdk.lib.paths import FilePathStr, StrPath, URIStr
 if TYPE_CHECKING:
     import google.cloud.storage as gcs_module  # type: ignore
 
-    from wandb.sdk.artifacts.artifact import Artifact as ArtifactInterface
+    from wandb.sdk.artifacts.artifact import Artifact
 
 
 class GCSHandler(StorageHandler):
     _client: Optional["gcs_module.client.Client"]
-    _versioning_enabled: Optional[bool]
 
     def __init__(self, scheme: Optional[str] = None) -> None:
         self._scheme = scheme or "gs"
         self._client = None
-        self._versioning_enabled = None
-        self._cache = get_artifacts_cache()
-
-    def versioning_enabled(self, bucket_path: str) -> bool:
-        if self._versioning_enabled is not None:
-            return self._versioning_enabled
-        self.init_gcs()
-        assert self._client is not None  # mypy: unwraps optionality
-        bucket = self._client.bucket(bucket_path)
-        bucket.reload()
-        self._versioning_enabled = bucket.versioning_enabled
-        return self._versioning_enabled
+        self._cache = get_artifact_file_cache()
 
     def can_handle(self, parsed_url: "ParseResult") -> bool:
         return parsed_url.scheme == self._scheme
@@ -106,7 +93,7 @@ class GCSHandler(StorageHandler):
 
     def store_path(
         self,
-        artifact: "ArtifactInterface",
+        artifact: "Artifact",
         path: Union[URIStr, FilePathStr],
         name: Optional[StrPath] = None,
         checksum: bool = True,
@@ -121,16 +108,14 @@ class GCSHandler(StorageHandler):
         bucket, key, version = self._parse_uri(path)
         path = URIStr(f"{self._scheme}://{bucket}/{key}")
         max_objects = max_objects or DEFAULT_MAX_OBJECTS
-        if not self.versioning_enabled(bucket) and version:
-            raise ValueError(
-                f"Specifying a versionId is not valid for s3://{bucket} as it does not have versioning enabled."
-            )
 
         if not checksum:
             return [ArtifactManifestEntry(path=name or key, ref=path, digest=path)]
 
         start_time = None
         obj = self._client.bucket(bucket).get_blob(key, generation=version)
+        if obj is None and version is not None:
+            raise ValueError(f"Object does not exist: {path}#{version}")
         multi = obj is None
         if multi:
             start_time = time.time()
@@ -213,12 +198,3 @@ class GCSHandler(StorageHandler):
             "etag": obj.etag,
             "versionID": obj.generation,
         }
-
-    @staticmethod
-    def _content_addressed_path(md5: str) -> FilePathStr:
-        # TODO: is this the structure we want? not at all human
-        # readable, but that's probably OK. don't want people
-        # poking around in the bucket
-        return FilePathStr(
-            "wandb/%s" % base64.b64encode(md5.encode("ascii")).decode("ascii")
-        )
